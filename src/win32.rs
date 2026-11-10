@@ -124,13 +124,17 @@ pub struct NONCLIENTMETRICSW {
     pub iMenuWidth: i32,
     pub iMenuHeight: i32,
     pub lfMenuFont: LOGFONTW,
-    pub iStatusWidth: i32,
-    pub iStatusHeight: i32,
     pub lfStatusFont: LOGFONTW,
-    pub iMessageWidth: i32,
     pub lfMessageFont: LOGFONTW,
     pub iPaddedBorderWidth: i32,
 }
+
+// `SystemParametersInfoW` only accepts the sizes Windows itself knows: 504
+// on Vista and later (500 before `iPaddedBorderWidth`). A wrong `cbSize`
+// makes the call fail, and the caller then renders with a zeroed LOGFONT —
+// which GDI answers with Arial. Compile-time guard so the field list cannot
+// drift again.
+const _: () = assert!(core::mem::size_of::<NONCLIENTMETRICSW>() == 504);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -251,6 +255,9 @@ pub const BI_RGB: u32 = 0;
 
 // GDI
 pub const CLEARTYPE_QUALITY: u8 = 5;
+/// Let GDI take the charset from the text instead of screening the face
+/// against one fixed code page (see `render::create_font`).
+pub const DEFAULT_CHARSET: u8 = 1;
 pub const DT_SINGLELINE: u32 = 0x20;
 pub const DT_VCENTER: u32 = 0x04;
 pub const DT_NOPREFIX: u32 = 0x0800;
@@ -444,6 +451,7 @@ unsafe extern "system" {
         dwOffset: u32,
     ) -> HBITMAP;
     pub fn CreateFontIndirectW(lplf: *const LOGFONTW) -> HFONT;
+    pub fn GetTextFaceW(hdc: HDC, c: i32, lpFaceName: *mut u16) -> i32;
     pub fn SetBkColor(hdc: HDC, color: COLORREF) -> COLORREF;
     pub fn SetTextColor(hdc: HDC, color: COLORREF) -> COLORREF;
     pub fn DrawTextW(

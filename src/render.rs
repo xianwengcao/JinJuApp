@@ -64,9 +64,13 @@ fn set_face_name(lf: &mut LOGFONTW, face: &str) {
 
 /// The configured face at its weight and point size, for the given DPI.
 ///
-/// The charset and pitch still come from the system message font, so a
-/// non-Chinese locale keeps its own mapping when GDI substitutes a face;
-/// only the face, weight and size come from `settings.json`.
+/// The metrics come from the system message font, but only as a starting
+/// point: face, weight, size and charset are all set from `settings.json`.
+/// The charset is `DEFAULT_CHARSET` rather than the message font's own,
+/// because GDI screens a named face against the requested charset — a face
+/// that declares only its own code page (the 方正 series ship as GB2312-only)
+/// is dropped and replaced by Arial when asked for another one, which reads
+/// on screen as "the font changed, but not to the one I asked for".
 unsafe fn create_font(dpi: u32, style: &Settings) -> HFONT {
     unsafe {
         let mut ncm: NONCLIENTMETRICSW = core::mem::zeroed();
@@ -88,8 +92,39 @@ unsafe fn create_font(dpi: u32, style: &Settings) -> HFONT {
         // ClearType rasterisation, folded back to grayscale coverage by
         // accumulate_layer: sharper stems, no coloured fringes on screen.
         lf.lfQuality = CLEARTYPE_QUALITY;
+        lf.lfCharSet = DEFAULT_CHARSET;
         set_face_name(&mut lf, &style.font);
         CreateFontIndirectW(&lf)
+    }
+}
+
+/// GDI substitutes a face it cannot resolve instead of failing, so a typo in
+/// `settings.json` shows up as an unexplained typeface rather than an error.
+/// Record the substitution next to the executable in `font.log` (the strip
+/// always renders); the file is removed again once the requested face is the
+/// one GDI picks, so its presence means "the configured font is not in use".
+#[cfg(not(test))]
+unsafe fn note_substituted_face(hdc: HDC, requested: &str) {
+    unsafe {
+        let mut buf = [0u16; 64];
+        if GetTextFaceW(hdc, buf.len() as i32, buf.as_mut_ptr()) <= 0 {
+            return;
+        }
+        let end = buf.iter().position(|&u| u == 0).unwrap_or(buf.len());
+        let resolved = String::from_utf16_lossy(&buf[..end]);
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let Some(dir) = exe.parent() else {
+            return;
+        };
+        let log = dir.join("font.log");
+        if resolved.eq_ignore_ascii_case(requested) {
+            let _ = std::fs::remove_file(&log);
+        } else {
+            let line = format!("font \"{requested}\" -> GDI chose \"{resolved}\"\n");
+            let _ = std::fs::write(&log, line);
+        }
     }
 }
 
@@ -157,6 +192,8 @@ impl Surface {
             let old_bmp = SelectObject(hdc, hbmp);
             let font = create_font(dpi, style);
             let old_font = SelectObject(hdc, font);
+            #[cfg(not(test))]
+            note_substituted_face(hdc, &style.font);
             Some(Surface {
                 width,
                 height,
