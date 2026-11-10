@@ -441,6 +441,8 @@ mod tests {
             size: 13,
             color: "#000000".to_string(),
             opacity: 1.0,
+            position: 1,
+            tray_icon: 0,
         };
         assert_eq!(parse(&to_json(&s).unwrap()).unwrap(), s);
     }

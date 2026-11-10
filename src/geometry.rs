@@ -50,6 +50,9 @@ impl Rect {
 ///   obstacle (the TrafficMonitor taskbar window) that would collide with
 ///   the strip shifts the limit to the obstacle's left when the strip can
 ///   fit entirely there.
+// eight plain values: a pure placement function reads better with explicit
+// parameters than with a wrapper struct the caller must build each time.
+#[allow(clippy::too_many_arguments)]
 pub fn place(
     work: &Rect,
     monitor: &Rect,
