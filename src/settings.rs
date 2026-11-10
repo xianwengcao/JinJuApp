@@ -377,7 +377,10 @@ mod tests {
     fn sanitize_rejects_a_bad_position() {
         let (s, note) = parse(r#"{"position":2}"#).unwrap().sanitized();
         assert_eq!(s.position, DEFAULT_POSITION);
-        assert!(note.expect("a note for a bad position").contains("position"));
+        assert!(
+            note.expect("a note for a bad position")
+                .contains("position")
+        );
 
         let (s, note) = parse(r#"{"position":-1}"#).unwrap().sanitized();
         assert_eq!(s.position, DEFAULT_POSITION);
@@ -398,7 +401,10 @@ mod tests {
     fn sanitize_rejects_a_bad_tray_icon() {
         let (s, note) = parse(r#"{"tray_icon":2}"#).unwrap().sanitized();
         assert_eq!(s.tray_icon, DEFAULT_TRAY_ICON);
-        assert!(note.expect("a note for a bad tray_icon").contains("tray_icon"));
+        assert!(
+            note.expect("a note for a bad tray_icon")
+                .contains("tray_icon")
+        );
 
         let (s, note) = parse(r#"{"tray_icon":0}"#).unwrap().sanitized();
         assert_eq!(s.tray_icon, 0);

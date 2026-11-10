@@ -139,7 +139,16 @@ mod tests {
 
     #[test]
     fn strip_is_drawn_inside_the_band_at_the_left_edge() {
-        let r = place(&BOTTOM_WORK, &MON, Some(BOTTOM_TRAY), None, false, 500, 45, MARGIN);
+        let r = place(
+            &BOTTOM_WORK,
+            &MON,
+            Some(BOTTOM_TRAY),
+            None,
+            false,
+            500,
+            45,
+            MARGIN,
+        );
         // Band 1552..1600 is 48 px tall, the strip is 45: centred at 1553.
         assert_eq!(r, Rect::new(MARGIN, 1553, 500, 45));
         assert!(r.top >= BOTTOM_WORK.bottom, "inside the bar band");
@@ -309,7 +318,16 @@ mod tests {
 
     #[test]
     fn right_align_ends_left_of_the_tray() {
-        let r = place(&BOTTOM_WORK, &MON, Some(BOTTOM_TRAY), None, true, 500, 45, MARGIN);
+        let r = place(
+            &BOTTOM_WORK,
+            &MON,
+            Some(BOTTOM_TRAY),
+            None,
+            true,
+            500,
+            45,
+            MARGIN,
+        );
         // Right edge at 3526 - 10; band 1552..1600 is 48 px tall, the
         // strip is 45: centred at 1553.
         assert_eq!(r, Rect::new(3016, 1553, 500, 45));

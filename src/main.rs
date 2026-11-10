@@ -565,12 +565,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
             }
             _ => {
                 if TASKBAR_CREATED.get() == Some(&msg) {
-        // Explorer restarted: the tray icon is gone, re-add it — unless
-        // the user hid it via settings.json.
-        if app_of(hwnd).is_some_and(|a| a.style.tray_icon == 1) {
-            tray::add(hwnd);
-        }
-        return 0;
+                    // Explorer restarted: the tray icon is gone, re-add it — unless
+                    // the user hid it via settings.json.
+                    if app_of(hwnd).is_some_and(|a| a.style.tray_icon == 1) {
+                        tray::add(hwnd);
+                    }
+                    return 0;
                 }
                 if msg == tray::WM_TRAY {
                     let Some(app) = app_of(hwnd) else { return 0 };
