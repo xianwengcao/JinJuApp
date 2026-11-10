@@ -103,7 +103,6 @@ unsafe fn create_font(dpi: u32, style: &Settings) -> HFONT {
 /// Record the substitution next to the executable in `font.log` (the strip
 /// always renders); the file is removed again once the requested face is the
 /// one GDI picks, so its presence means "the configured font is not in use".
-#[cfg(not(test))]
 unsafe fn note_substituted_face(hdc: HDC, requested: &str) {
     unsafe {
         let mut buf = [0u16; 64];
@@ -192,7 +191,6 @@ impl Surface {
             let old_bmp = SelectObject(hdc, hbmp);
             let font = create_font(dpi, style);
             let old_font = SelectObject(hdc, font);
-            #[cfg(not(test))]
             note_substituted_face(hdc, &style.font);
             Some(Surface {
                 width,
