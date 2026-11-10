@@ -12,14 +12,16 @@ mod geometry;
 mod layout;
 mod quotes;
 mod render;
+mod settings;
 mod startup;
 mod tray;
 mod win32;
 
-use geometry::{Edge, Rect};
+use geometry::Rect;
 use layout::Scroll;
 use quotes::{Bag, Rng, Source};
 use render::Surface;
+use settings::Settings;
 use win32::*;
 
 // ---------------------------------------------------------------------------
@@ -103,14 +105,29 @@ struct App {
     last_presented_alpha: i32,
     /// In-flight quote crossfade; `None` = no transition.
     transition: Option<Transition>,
+    /// Where the strip was last placed, so re-anchoring (which runs on
+    /// every quote change) only moves the window when the target changed.
+    placed: Option<(i32, i32)>,
+    /// Typeface settings from `settings.json`, reused when the DPI changes.
+    style: Settings,
+    /// Windows light-mode flag, resolved into `color: auto` and refreshed
+    /// when the taskbar theme changes.
+    light: bool,
     exe_path: String,
 }
 
 impl App {
-    fn new(hwnd: HWND, dpi: u32, quotes: Source, exe_path: String) -> Option<App> {
+    fn new(
+        hwnd: HWND,
+        dpi: u32,
+        quotes: Source,
+        style: Settings,
+        light: bool,
+        exe_path: String,
+    ) -> Option<App> {
         let win_w = scale_pt(WINDOW_W, dpi);
         let win_h = scale_pt(WINDOW_H, dpi);
-        let surface = Surface::new(win_w, win_h, dpi)?;
+        let surface = Surface::new(win_w, win_h, dpi, &style, light)?;
         let bag = Bag::new(quotes.lines().len());
         let speed_px_per_s = SCROLL_SPEED_LOGICAL * dpi as f32 / 96.0;
         Some(App {
@@ -128,6 +145,9 @@ impl App {
             last_presented_x: i32::MIN,
             last_presented_alpha: -1,
             transition: None,
+            placed: None,
+            style,
+            light,
             exe_path,
         })
     }
@@ -253,28 +273,60 @@ impl App {
         }
     }
 
-    /// Move to the strip adjacent to the taskbar (any docked edge).
+    /// Move the strip to its configured corner of the usable desktop.
+    ///
+    /// Anchored to the work area, so the taskbar — whatever edge it is
+    /// docked to — can never be covered. `settings.json`'s `position`
+    /// picks the horizontal anchor: 0 = bottom-left (v1 parity),
+    /// 1 = bottom-right, ending at the notification area's left edge.
     fn reposition(&mut self) {
-        let Some((taskbar, edge, monitor)) = desktop_geometry() else {
+        let Some((monitor, work)) = desktop_geometry() else {
             return;
         };
         let r = geometry::place(
-            &taskbar,
+            &work,
             &monitor,
-            edge,
+            notification_area(),
+            traffic_monitor_window(),
+            self.style.position == 1,
             self.win_w,
             self.win_h,
             PLACE_MARGIN,
         );
+        if self.placed == Some((r.left, r.top)) {
+            return; // already there; the tray or DPI has not moved since
+        }
+        self.placed = Some((r.left, r.top));
         unsafe {
             MoveWindow(self.hwnd, r.left, r.top, self.win_w, self.win_h, 0);
         }
     }
 
+    /// Re-resolve `color: auto` against the taskbar's light/dark mode.
+    ///
+    /// Called on WM_SETTINGCHANGE, which is also how Windows broadcasts a
+    /// theme switch. Only a real change rebuilds the surface.
+    fn follow_theme(&mut self) {
+        let light = system_uses_light_theme();
+        if light == self.light {
+            return;
+        }
+        self.light = light;
+        if let Some(surface) = Surface::new(self.win_w, self.win_h, self.dpi, &self.style, light) {
+            self.surface = surface;
+            self.refresh();
+        }
+    }
+
     /// DPI changed (window moved between monitors): rebuild at new size.
-    fn on_dpi_changed(&mut self, dpi: u32, suggested: &RECT) {
-        let Some(surface) = Surface::new(scale_pt(WINDOW_W, dpi), scale_pt(WINDOW_H, dpi), dpi)
-        else {
+    fn on_dpi_changed(&mut self, dpi: u32) {
+        let Some(surface) = Surface::new(
+            scale_pt(WINDOW_W, dpi),
+            scale_pt(WINDOW_H, dpi),
+            dpi,
+            &self.style,
+            self.light,
+        ) else {
             return;
         };
         self.surface = surface;
@@ -286,17 +338,10 @@ impl App {
         self.scroll = Scroll::new(self.win_w, 0, SCROLL_SPEED_LOGICAL * dpi as f32 / 96.0);
         // An in-flight crossfade's cached geometry belongs to the old DPI.
         self.transition = None;
-        unsafe {
-            SetWindowPos(
-                self.hwnd,
-                core::ptr::null_mut(),
-                suggested.left,
-                suggested.top,
-                suggested.right - suggested.left,
-                suggested.bottom - suggested.top,
-                SWP_NOACTIVATE, // size already correct; follow the suggestion
-            );
-        }
+        // Re-anchor rather than trusting the suggested rect: the strip's
+        // position is derived from the work area, not from where Windows
+        // thinks this window belonged before the scale change.
+        self.reposition();
         self.refresh();
     }
 
@@ -318,54 +363,110 @@ fn scale_pt(v: i32, dpi: u32) -> i32 {
     ((i64::from(v) * i64::from(dpi) + 95) / 96) as i32
 }
 
-/// Taskbar rect + docked edge + primary monitor rect.
-fn desktop_geometry() -> Option<(Rect, Edge, Rect)> {
+/// Windows light-mode flag for the taskbar
+/// (`HKCU\...\Themes\Personalize\SystemUsesLightTheme`). Missing or
+/// unreadable values mean light, the Windows default.
+fn system_uses_light_theme() -> bool {
+    const KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+    const VALUE: &str = "SystemUsesLightTheme";
+    unsafe {
+        let sub = widez(KEY);
+        let name = widez(VALUE);
+        let mut hkey: HKEY = core::ptr::null_mut();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+            return true;
+        }
+        let mut data = [0u8; 4];
+        let mut size: u32 = data.len() as u32;
+        let mut ty: u32 = 0;
+        let ok = RegQueryValueExW(
+            hkey,
+            name.as_ptr(),
+            core::ptr::null_mut(),
+            &mut ty,
+            data.as_mut_ptr(),
+            &mut size,
+        );
+        RegCloseKey(hkey);
+        if ok != 0 || ty != REG_DWORD || size < 4 {
+            return true;
+        }
+        u32::from_le_bytes(data) != 0
+    }
+}
+
+/// The TrafficMonitor taskbar window, when that app is running.
+///
+/// TrafficMonitor parents its strip to the taskbar and titles it
+/// `TrafficMonitorTaskbarWindow`, so it is a child of `Shell_TrayWnd`
+/// rather than a top-level window. It is only an obstacle: the gold strip
+/// steps to its left when there is room.
+fn traffic_monitor_window() -> Option<Rect> {
+    unsafe {
+        let tray = FindWindowW(widez("Shell_TrayWnd").as_ptr(), core::ptr::null());
+        if tray.is_null() {
+            return None;
+        }
+        let window = FindWindowExW(
+            tray,
+            core::ptr::null_mut(),
+            core::ptr::null(),
+            widez("TrafficMonitorTaskbarWindow").as_ptr(),
+        );
+        if window.is_null() {
+            return None;
+        }
+        let mut r: RECT = core::mem::zeroed();
+        if GetWindowRect(window, &mut r) == 0 {
+            return None;
+        }
+        Some(Rect::from(r))
+    }
+}
+
+/// The shell's notification-area container (`TrayNotifyWnd`) in screen
+/// coordinates, when the shell exposes it.
+///
+/// It is a child of `Shell_TrayWnd`; its left edge is where the clock, IME
+/// indicator, tray icons and hidden-icon chevron begin. `None` means the
+/// strip simply uses the work area's right edge.
+fn notification_area() -> Option<Rect> {
+    unsafe {
+        let tray = FindWindowW(widez("Shell_TrayWnd").as_ptr(), core::ptr::null());
+        if tray.is_null() {
+            return None;
+        }
+        let notify = FindWindowExW(
+            tray,
+            core::ptr::null_mut(),
+            widez("TrayNotifyWnd").as_ptr(),
+            core::ptr::null(),
+        );
+        if notify.is_null() {
+            return None;
+        }
+        let mut r: RECT = core::mem::zeroed();
+        if GetWindowRect(notify, &mut r) == 0 {
+            return None;
+        }
+        Some(Rect::from(r))
+    }
+}
+
+/// Primary monitor rect + its work area (the desktop minus the taskbar).
+///
+/// The work area is the placement authority: Windows maintains it for every
+/// docked edge, so the strip can be anchored away from the bar without
+/// classifying the edge or trusting an appbar query.
+fn desktop_geometry() -> Option<(Rect, Rect)> {
     unsafe {
         let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
-        let mut mi = MONITORINFO {
-            cbSize: core::mem::size_of::<MONITORINFO>() as u32,
-            rcMonitor: RECT {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            },
-            rcWork: RECT {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            },
-            dwFlags: 0,
-        };
+        let mut mi: MONITORINFO = core::mem::zeroed();
+        mi.cbSize = core::mem::size_of::<MONITORINFO>() as u32;
         if GetMonitorInfoW(monitor, &mut mi) == 0 {
             return None;
         }
-        let mon = Rect::from(mi.rcMonitor);
-        let mut abd = APPBARDATA {
-            cbSize: core::mem::size_of::<APPBARDATA>() as u32,
-            hWnd: core::ptr::null_mut(),
-            uCallbackMessage: 0,
-            uEdge: 0,
-            rc: RECT {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            },
-            lParam: 0,
-        };
-        if SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd) == 0 {
-            // No appbar answer: assume a bottom taskbar of typical height.
-            let tb = Rect::new(
-                mon.left,
-                mon.bottom - scale_pt(48, 96),
-                mon.width(),
-                scale_pt(48, 96),
-            );
-            return Some((tb, Edge::Bottom, mon));
-        }
-        Some((Rect::from(abd.rc), Edge::from_abe(abd.uEdge), mon))
+        Some((Rect::from(mi.rcMonitor), Rect::from(mi.rcWork)))
     }
 }
 
@@ -414,6 +515,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
                         if IsWindowVisible(hwnd) == 0 {
                             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                         }
+                        // Follow the notification area: tray icons (and so
+                        // the chevron) move as apps hide and show them.
+                        app.reposition();
                         app.next_quote();
                     }
                     SCROLL_TIMER => app.tick_scroll(),
@@ -437,14 +541,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
             WM_DPICHANGED => {
                 let Some(app) = app_of(hwnd) else { return 0 };
                 let dpi = ((wp >> 16) & 0xFFFF) as u32;
-                let suggested = lp as *const RECT;
-                if !suggested.is_null() {
-                    app.on_dpi_changed(dpi, &*suggested);
-                }
+                app.on_dpi_changed(dpi);
                 0
             }
             WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
                 let Some(app) = app_of(hwnd) else { return 0 };
+                // Theme switches arrive here too; this is what keeps the
+                // text readable when the taskbar flips to dark mode.
+                app.follow_theme();
                 app.reposition();
                 0
             }
@@ -461,9 +565,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
             }
             _ => {
                 if TASKBAR_CREATED.get() == Some(&msg) {
-                    // Explorer restarted: the tray icon is gone, re-add it.
-                    tray::add(hwnd);
-                    return 0;
+        // Explorer restarted: the tray icon is gone, re-add it — unless
+        // the user hid it via settings.json.
+        if app_of(hwnd).is_some_and(|a| a.style.tray_icon == 1) {
+            tray::add(hwnd);
+        }
+        return 0;
                 }
                 if msg == tray::WM_TRAY {
                     let Some(app) = app_of(hwnd) else { return 0 };
@@ -567,13 +674,22 @@ fn main() {
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let quotes = quotes::load(&exe_dir);
-    if let Some(reason) = quotes.note().filter(|_| !cli.quiet) {
-        alert(
-            core::ptr::null_mut(),
-            &format!(
+    let (style, style_note) = settings::load(&exe_dir);
+    if !cli.quiet {
+        // One dialog for every startup problem: the user fixes the files in
+        // one pass instead of restarting once per message box.
+        let mut problems: Vec<String> = Vec::new();
+        if let Some(reason) = quotes.note() {
+            problems.push(format!(
                 "{reason}\n\n本次运行使用内置金句。修正该文件后重启应用即可。\n文件格式：[{{\"quote\": \"…\"}}, …]"
-            ),
-        );
+            ));
+        }
+        if let Some(reason) = style_note {
+            problems.push(reason);
+        }
+        if !problems.is_empty() {
+            alert(core::ptr::null_mut(), &problems.join("\n\n"));
+        }
     }
 
     unsafe {
@@ -602,7 +718,15 @@ fn main() {
         TASKBAR_CREATED.get_or_init(|| RegisterWindowMessageW(widez("TaskbarCreated").as_ptr()));
 
         let dpi = primary_dpi();
-        let app = match App::new(core::ptr::null_mut(), dpi, quotes, exe.clone()) {
+        let light = system_uses_light_theme();
+        let app = match App::new(
+            core::ptr::null_mut(),
+            dpi,
+            quotes,
+            style,
+            light,
+            exe.clone(),
+        ) {
             Some(a) => a,
             None => {
                 alert(core::ptr::null_mut(), "初始化渲染表面失败");
@@ -647,7 +771,10 @@ fn main() {
             );
         }
 
-        if !tray::add(hwnd) {
+        // The tray icon is opt-out: `settings.json`'s `tray_icon: 0`
+        // keeps it out of the notification area. Without the icon the
+        // app can only be exited via Task Manager.
+        if (*app).style.tray_icon == 1 && !tray::add(hwnd) {
             alert(
                 hwnd,
                 "无法创建托盘图标：请通过任务管理器结束 JinJuApp.exe 退出。",

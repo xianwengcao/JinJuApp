@@ -1,22 +1,22 @@
 //! Text rendering into a per-pixel-alpha ARGB surface.
 //!
 //! Pipeline: GDI draws each text layer **white on black** into a 32-bpp
-//! top-down DIB (the red channel then carries per-pixel coverage —
-//! grayscale antialiasing, correct on alpha surfaces where ClearType is
-//! not), and [`accumulate_layer`] blends the mask, scaled by the layer's
-//! opacity, into a premultiplied ARGB frame that `UpdateLayeredWindow`
-//! expects. Two layers crossfade by simple addition. The blending is a
-//! pure function; the GDI half is a thin resource-owning host.
+//! top-down DIB, and [`accumulate_layer`] blends that mask, scaled by the
+//! layer's opacity, into a premultiplied ARGB frame that
+//! `UpdateLayeredWindow` expects. Two layers crossfade by simple addition.
+//!
+//! The mask is read as **luminance**, and the text is rasterised with
+//! ClearType: its subpixel hinting snaps stems to the pixel grid the way
+//! the taskbar's own text is drawn, and folding R/G/B back into one
+//! coverage value keeps the coloured fringes off a per-pixel-alpha
+//! surface. Plain grayscale antialiasing (what this used to use) leaves
+//! the same glyph about one pixel softer and fatter.
+//!
+//! The blending is a pure function; the GDI half is a thin resource-owning
+//! host.
 
+use crate::settings::Settings;
 use crate::win32::*;
-
-/// Text color and maximum opacity, matching the original app's
-/// `rgba(30, 30, 30, 0.85)`.
-pub const COLOR: (u8, u8, u8) = (30, 30, 30);
-pub const MAX_ALPHA: u8 = 217; // 0.85 * 255
-
-/// Font size in points (the original app used 13 pt).
-const FONT_PT: i32 = 13;
 
 fn scale(c: u8, a: u8) -> u8 {
     ((u32::from(c) * u32::from(a) + 127) / 255) as u8
@@ -38,7 +38,13 @@ pub fn accumulate_layer(
     let (mp, _) = mask.as_chunks::<4>();
     let (fp, _) = frame.as_chunks_mut::<4>();
     for (m, f) in mp.iter().zip(fp.iter_mut()) {
-        let a = scale(scale(max_alpha, m[2]), alpha_q);
+        // Luminance (0.299 R + 0.587 G + 0.114 B) of a white-on-black mask
+        // pixel: with ClearType the three channels differ per subpixel, and
+        // averaging them back is what turns the coloured rasterisation into
+        // a usable grayscale coverage value.
+        let cov =
+            ((u32::from(m[2]) * 77 + u32::from(m[1]) * 150 + u32::from(m[0]) * 29) >> 8) as u8;
+        let a = scale(scale(max_alpha, cov), alpha_q);
         f[0] = f[0].saturating_add(scale(color.2, a));
         f[1] = f[1].saturating_add(scale(color.1, a));
         f[2] = f[2].saturating_add(scale(color.0, a));
@@ -46,9 +52,22 @@ pub fn accumulate_layer(
     }
 }
 
-/// System UI font (Microsoft YaHei UI on zh-CN, Segoe UI elsewhere) at
-/// `FONT_PT` points for the given DPI — no hard-coded typeface name.
-unsafe fn create_font(dpi: u32) -> HFONT {
+/// Write `face` into a `LOGFONTW` name field: UTF-16, NUL-terminated,
+/// at most 31 units plus the terminator (the field is `[u16; 32]`).
+/// Pure — the truncation contract is unit-tested.
+fn set_face_name(lf: &mut LOGFONTW, face: &str) {
+    lf.lfFaceName = [0; 32];
+    for (slot, unit) in lf.lfFaceName.iter_mut().zip(face.encode_utf16().take(31)) {
+        *slot = unit;
+    }
+}
+
+/// The configured face at its weight and point size, for the given DPI.
+///
+/// The charset and pitch still come from the system message font, so a
+/// non-Chinese locale keeps its own mapping when GDI substitutes a face;
+/// only the face, weight and size come from `settings.json`.
+unsafe fn create_font(dpi: u32, style: &Settings) -> HFONT {
     unsafe {
         let mut ncm: NONCLIENTMETRICSW = core::mem::zeroed();
         ncm.cbSize = core::mem::size_of::<NONCLIENTMETRICSW>() as u32;
@@ -64,11 +83,12 @@ unsafe fn create_font(dpi: u32) -> HFONT {
             core::mem::zeroed()
         };
         // Negative height = character height; points → pixels at this DPI.
-        lf.lfHeight = -MulDiv(FONT_PT, dpi as i32, 72);
-        lf.lfWeight = FW_LIGHT;
-        // Grayscale AA: ClearType assumes an opaque destination and would
-        // produce colored fringes on a per-pixel-alpha surface.
-        lf.lfQuality = ANTIALIASED_QUALITY;
+        lf.lfHeight = -MulDiv(style.size, dpi as i32, 72);
+        lf.lfWeight = style.weight;
+        // ClearType rasterisation, folded back to grayscale coverage by
+        // accumulate_layer: sharper stems, no coloured fringes on screen.
+        lf.lfQuality = CLEARTYPE_QUALITY;
+        set_face_name(&mut lf, &style.font);
         CreateFontIndirectW(&lf)
     }
 }
@@ -82,13 +102,24 @@ pub struct Surface {
     bits: *mut u8,
     frame: Vec<u8>, // premultiplied accumulation buffer (w*h*4)
     font: HFONT,
+    /// Text colour and opacity, from `settings.json`.
+    color: (u8, u8, u8),
+    alpha: u8,
     old_bmp: HGDIOBJ,
     old_font: HGDIOBJ,
 }
 
 impl Surface {
-    /// Create a surface of `width` × `height` px at `dpi`.
-    pub fn new(width: i32, height: i32, dpi: u32) -> Option<Surface> {
+    /// Create a surface of `width` × `height` px at `dpi`, drawing with
+    /// the typeface and colour described by `style`; `light_theme` resolves
+    /// a `color: auto` against the taskbar's light/dark mode.
+    pub fn new(
+        width: i32,
+        height: i32,
+        dpi: u32,
+        style: &Settings,
+        light_theme: bool,
+    ) -> Option<Surface> {
         if width <= 0 || height <= 0 {
             return None;
         }
@@ -124,7 +155,7 @@ impl Surface {
                 return None;
             }
             let old_bmp = SelectObject(hdc, hbmp);
-            let font = create_font(dpi);
+            let font = create_font(dpi, style);
             let old_font = SelectObject(hdc, font);
             Some(Surface {
                 width,
@@ -134,6 +165,8 @@ impl Surface {
                 bits: bits as *mut u8,
                 frame: vec![0; (width as usize) * (height as usize) * 4],
                 font,
+                color: style.rgb(light_theme),
+                alpha: style.alpha(),
                 old_bmp,
                 old_font,
             })
@@ -208,7 +241,7 @@ impl Surface {
             // `bits` is a raw pointer field — reading it holds no borrow,
             // so the mask slice can coexist with `&mut self.frame`.
             let mask = unsafe { core::slice::from_raw_parts(self.bits, len) };
-            accumulate_layer(mask, &mut self.frame, COLOR, MAX_ALPHA, alpha_q);
+            accumulate_layer(mask, &mut self.frame, self.color, self.alpha, alpha_q);
         }
         // Copy the composed frame back into the DIB for ULW. Raw-pointer
         // copy: `bits_mut()` would take `&mut self` and clash with the
@@ -250,6 +283,12 @@ impl Drop for Surface {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings;
+
+    /// The shipped defaults, spelled out so the blend arithmetic reads at
+    /// each call site.
+    const COLOR: (u8, u8, u8) = (30, 30, 30);
+    const MAX_ALPHA: u8 = 217;
 
     fn px(b: &[u8]) -> [u8; 4] {
         [b[0], b[1], b[2], b[3]]
@@ -268,7 +307,7 @@ mod tests {
         // White solid: coverage 255. Premultiplied: rgb = color * alpha,
         // so 30 * 217/255 = 26 — the *displayed* color stays 30/255 at
         // 85% opacity, which is exactly what premultiplication means.
-        let mask = [0u8, 0, 255, 0];
+        let mask = [255u8, 255, 255, 0];
         let mut frame = [0u8; 4];
         accumulate_layer(&mask, &mut frame, COLOR, MAX_ALPHA, 255);
         let expected = [
@@ -283,7 +322,7 @@ mod tests {
 
     #[test]
     fn half_coverage_blends_by_coverage() {
-        let mask = [0u8, 0, 128, 0];
+        let mask = [128u8, 128, 128, 0];
         let mut frame = [0u8; 4];
         accumulate_layer(&mask, &mut frame, COLOR, MAX_ALPHA, 255);
         let a = scale(217, 128);
@@ -292,7 +331,7 @@ mod tests {
 
     #[test]
     fn full_opacity_max_alpha_is_255() {
-        let mask = [0u8, 0, 255, 0];
+        let mask = [255u8, 255, 255, 0];
         let mut frame = [0u8; 4];
         accumulate_layer(&mask, &mut frame, (10, 20, 30), 255, 255);
         assert_eq!(px(&frame), [30, 20, 10, 255]);
@@ -300,7 +339,7 @@ mod tests {
 
     #[test]
     fn layer_alpha_scales_opacity() {
-        let mask = [0u8, 0, 255, 0];
+        let mask = [255u8, 255, 255, 0];
         let mut frame = [0u8; 4];
         accumulate_layer(&mask, &mut frame, COLOR, MAX_ALPHA, 128);
         let a = scale(MAX_ALPHA, 128);
@@ -309,7 +348,7 @@ mod tests {
 
     #[test]
     fn zero_alpha_layer_is_invisible() {
-        let mask = [0u8, 0, 255, 0];
+        let mask = [255u8, 255, 255, 0];
         let mut frame = [0u8; 4];
         accumulate_layer(&mask, &mut frame, COLOR, MAX_ALPHA, 0);
         assert_eq!(frame, [0u8; 4]);
@@ -317,7 +356,7 @@ mod tests {
 
     #[test]
     fn two_layers_accumulate_with_saturation() {
-        let mask = [0u8, 0, 255, 0];
+        let mask = [255u8, 255, 255, 0];
         let mut frame = [0u8; 4];
         accumulate_layer(&mask, &mut frame, COLOR, MAX_ALPHA, 255);
         let once = px(&frame);
@@ -333,10 +372,53 @@ mod tests {
 
     #[test]
     fn trailing_partial_chunk_is_untouched() {
-        let mask = [0u8, 0, 255, 0, 9, 9];
+        let mask = [255u8, 255, 255, 0, 9, 9];
         let mut frame = [0u8, 0, 0, 0, 7, 7];
         accumulate_layer(&mask, &mut frame, COLOR, MAX_ALPHA, 255);
         assert_eq!(&frame[4..], &[7, 7]);
+    }
+
+    #[test]
+    fn face_name_is_utf16_and_nul_terminated() {
+        let mut lf: LOGFONTW = unsafe { core::mem::zeroed() };
+        set_face_name(&mut lf, settings::DEFAULT_FACE);
+        let units: Vec<u16> = lf
+            .lfFaceName
+            .iter()
+            .copied()
+            .take_while(|&u| u != 0)
+            .collect();
+        assert_eq!(String::from_utf16(&units).unwrap(), settings::DEFAULT_FACE);
+        assert_eq!(
+            lf.lfFaceName[settings::DEFAULT_FACE.len()],
+            0,
+            "terminated right after the face"
+        );
+    }
+
+    #[test]
+    fn face_name_truncates_to_the_field() {
+        let mut lf: LOGFONTW = unsafe { core::mem::zeroed() };
+        set_face_name(&mut lf, &"X".repeat(40));
+        assert_eq!(lf.lfFaceName[..31], [u16::from(b'X'); 31]);
+        assert_eq!(lf.lfFaceName[31], 0, "the 32nd unit is reserved for NUL");
+    }
+
+    /// The mask is white-on-black rasterisation, but ClearType puts
+    /// different coverage in R, G and B; the blend must read luminance, not
+    /// one channel. A pure-red pixel carries 0.299 of full coverage.
+    #[test]
+    fn coverage_is_luminance_not_a_single_channel() {
+        let mut frame = [0u8; 4];
+        accumulate_layer(&[0, 0, 255, 0], &mut frame, (0, 0, 0), 255, 255);
+        let a = frame[3];
+        assert_eq!(
+            a, 76,
+            "red-only coverage must weigh 0.299 of full (got {a})"
+        );
+        let mut frame = [0u8; 4];
+        accumulate_layer(&[255, 255, 255, 0], &mut frame, (0, 0, 0), 255, 255);
+        assert_eq!(frame[3], 255, "white is full coverage");
     }
 
     #[test]
@@ -355,7 +437,7 @@ mod tests {
     /// strip's right edge, where the tail arrives during the slide.
     #[test]
     fn draw_renders_tail_when_origin_is_negative() {
-        let mut s = Surface::new(500, 36, 96).expect("GDI surface");
+        let mut s = Surface::new(500, 36, 96, &Settings::default(), true).expect("GDI surface");
         // ~120 ASCII chars ≈ 800 px wide at 13 pt — far wider than 500.
         let text = "The quick brown fox jumps over the lazy dog and keeps \
                     running far beyond the edge of the strip ABCDEFGHIJKL \
@@ -384,7 +466,7 @@ mod tests {
     /// test hard-coding any one font's pixel metrics.
     #[test]
     fn measure_cjk_long_quote_overflows_strip() {
-        let s = Surface::new(500, 36, 96).expect("GDI surface");
+        let s = Surface::new(500, 36, 96, &Settings::default(), true).expect("GDI surface");
         let q = "翻山越岭只为一场遇见，全力以赴只为一次改变。答案就在眼泪里，\
                  也凝结在汗水中、感官和心灵。";
         let ascii = "abcdefghijklmnopqrstuvwxyz0123456789abcdefgh";
@@ -404,7 +486,7 @@ mod tests {
     /// The symmetric half: with the origin at rest the head is visible.
     #[test]
     fn draw_renders_head_at_rest() {
-        let mut s = Surface::new(500, 36, 96).expect("GDI surface");
+        let mut s = Surface::new(500, 36, 96, &Settings::default(), true).expect("GDI surface");
         s.draw(&[("金句", 15, 1.0)]);
         let (w, h) = (s.width as usize, s.height as usize);
         let buf = s.bits_mut();
@@ -422,7 +504,7 @@ mod tests {
     /// Two layers at different positions and opacities must both leave ink.
     #[test]
     fn draw_blends_two_layers() {
-        let mut s = Surface::new(500, 36, 96).expect("GDI surface");
+        let mut s = Surface::new(500, 36, 96, &Settings::default(), true).expect("GDI surface");
         s.draw(&[("金句", 15, 0.5), ("金句", 200, 0.5)]);
         let (w, h) = (s.width as usize, s.height as usize);
         let buf = s.bits_mut();
@@ -447,7 +529,7 @@ mod tests {
     /// A layer with zero alpha is a complete no-op.
     #[test]
     fn draw_zero_alpha_leaves_no_ink() {
-        let mut s = Surface::new(500, 36, 96).expect("GDI surface");
+        let mut s = Surface::new(500, 36, 96, &Settings::default(), true).expect("GDI surface");
         s.draw(&[("金句", 15, 0.0)]);
         let buf = s.bits_mut();
         assert!(
@@ -456,17 +538,17 @@ mod tests {
         );
     }
 
-    /// Layer opacity modulates the accumulated ink end to end: at 0.5 the
-    /// solid-glyph alpha is scale(217, 128) = 109, not the full 217.
+    /// Layer opacity modulates the accumulated ink end to end: with the
+    /// opaque default, a half-alpha layer leaves roughly half the ink.
     #[test]
     fn draw_half_alpha_scales_ink() {
-        let mut s = Surface::new(500, 36, 96).expect("GDI surface");
+        let mut s = Surface::new(500, 36, 96, &Settings::default(), true).expect("GDI surface");
         s.draw(&[("金句", 15, 0.5)]);
         let buf = s.bits_mut();
         let max_a = buf.iter().skip(3).step_by(4).copied().max().unwrap_or(0);
         assert!(
-            (100..=118).contains(&max_a),
-            "half-opacity layer must halve the ink alpha (got {max_a}; full opacity would be {MAX_ALPHA})"
+            (118..=136).contains(&max_a),
+            "half-opacity layer must halve the ink alpha (got {max_a}; full opacity is 255)"
         );
     }
 }

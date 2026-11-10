@@ -143,17 +143,6 @@ pub struct MONITORINFO {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct APPBARDATA {
-    pub cbSize: DWORD,
-    pub hWnd: HWND,
-    pub uCallbackMessage: UINT,
-    pub uEdge: UINT,
-    pub rc: RECT,
-    pub lParam: LPARAM,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
 pub struct GUID {
     pub Data1: u32,
     pub Data2: u16,
@@ -261,8 +250,7 @@ pub const DIB_RGB_COLORS: u32 = 0;
 pub const BI_RGB: u32 = 0;
 
 // GDI
-pub const FW_LIGHT: i32 = 300;
-pub const ANTIALIASED_QUALITY: u8 = 4;
+pub const CLEARTYPE_QUALITY: u8 = 5;
 pub const DT_SINGLELINE: u32 = 0x20;
 pub const DT_VCENTER: u32 = 0x04;
 pub const DT_NOPREFIX: u32 = 0x0800;
@@ -285,9 +273,6 @@ pub const TPM_RIGHTBUTTON: u32 = 0x0000_0002;
 pub const TPM_BOTTOMALIGN: u32 = 0x0000_0020;
 pub const TPM_RETURNCMD: u32 = 0x0000_0100;
 
-// appbar
-pub const ABM_GETTASKBARPOS: u32 = 5;
-
 // misc
 pub const SPI_GETNONCLIENTMETRICS: u32 = 0x0029;
 pub const LOGPIXELSX: i32 = 88;
@@ -307,6 +292,7 @@ pub const KEY_READ: u32 = 0x0002_0019;
 // fail the DACL check with ERROR_ACCESS_DENIED.
 pub const KEY_SET_VALUE: u32 = 0x0002;
 pub const REG_SZ: u32 = 1;
+pub const REG_DWORD: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // kernel32
@@ -415,6 +401,14 @@ unsafe extern "system" {
     pub fn GetCursorPos(lpPoint: *mut POINT) -> BOOL;
     pub fn SetWindowLongPtrW(hWnd: HWND, nIndex: i32, dwNewLong: isize) -> isize;
     pub fn GetWindowLongPtrW(hWnd: HWND, nIndex: i32) -> isize;
+    pub fn FindWindowW(lpClassName: *const u16, lpWindowName: *const u16) -> HWND;
+    pub fn FindWindowExW(
+        hWndParent: HWND,
+        hWndChildAfter: HWND,
+        lpszClass: *const u16,
+        lpszWindow: *const u16,
+    ) -> HWND;
+    pub fn GetWindowRect(hWnd: HWND, lpRect: *mut RECT) -> BOOL;
     pub fn MonitorFromPoint(pt: POINT, dwFlags: u32) -> HANDLE;
     pub fn GetMonitorInfoW(hMonitor: HANDLE, lpmi: *mut MONITORINFO) -> BOOL;
     pub fn MessageBoxW(hWnd: HWND, lpText: *const u16, lpCaption: *const u16, uType: u32) -> i32;
@@ -481,7 +475,6 @@ unsafe extern "system" {
         lpDirectory: *const u16,
         nShow: i32,
     ) -> HANDLE;
-    pub fn SHAppBarMessage(dwMessage: u32, pData: *mut APPBARDATA) -> usize;
 }
 
 // ---------------------------------------------------------------------------
