@@ -45,11 +45,11 @@ const Z_ORDER_TIMER: usize = 3;
 /// stands while the incoming line fades in at rest.
 const TRANSITION_MS: u64 = 400;
 /// The strip shares the taskbar band with explorer, which re-asserts its
-/// own topmost status whenever the taskbar is activated (icon clicks,
-/// new buttons, flyouts). Diagnostics showed a demoted strip stayed
-/// hidden until the next quote change (minutes). Re-assert at this
-/// cadence so any cover is bounded to one interval.
-const Z_ORDER_INTERVAL_MS: u32 = 500;
+/// own topmost status whenever the taskbar is activated — including when
+/// a click on the (click-through) strip lands on the bar beneath it, which
+/// is what makes the text visibly blink at a 500 ms cadence. Re-assert at
+/// this cadence so any cover is bounded to ~2 frames and reads as nothing.
+const Z_ORDER_INTERVAL_MS: u32 = 100;
 
 /// Message id the shell broadcasts when the taskbar is (re)created.
 static TASKBAR_CREATED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
