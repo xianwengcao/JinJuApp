@@ -54,6 +54,13 @@ const Z_ORDER_INTERVAL_MS: u32 = 100;
 /// Message id the shell broadcasts when the taskbar is (re)created.
 static TASKBAR_CREATED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
+/// The strip's window handle, for the WinEvent callback — the event only
+/// names the window it fired on (the taskbar), never our own.
+static STRIP_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// Cached `Shell_TrayWnd` handle; 0 = not resolved yet. Cleared on the
+/// shell's `TaskbarCreated` broadcast so an explorer restart re-resolves.
+static TASKBAR_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
 // ---------------------------------------------------------------------------
 // Command line (pure, unit-tested)
 // ---------------------------------------------------------------------------
@@ -492,6 +499,69 @@ unsafe fn app_of(hwnd: HWND) -> Option<&'static mut App> {
     }
 }
 
+/// The taskbar raised itself above the strip: put the strip back at once.
+///
+/// Explorer re-asserts the bar's topmost status whenever it is activated —
+/// button clicks, flyouts — which covers the strip sharing its band until
+/// the Z_ORDER_TIMER next fires. This hook watches the bar's z-order moves
+/// and restores the strip within the same message cycle, so the overlap is
+/// under one frame and never reads as a blink. The timer stays as the
+/// safety net for covers this hook does not see.
+///
+/// Runs on the UI thread: the hook is OUTOFCONTEXT, delivered while the
+/// thread pumps messages. Legitimate overlays (menus, popups) are not
+/// fought here — only the taskbar's own z-order moves are.
+unsafe extern "system" fn on_taskbar_reordered(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    use std::sync::atomic::Ordering;
+    if event != EVENT_OBJECT_REORDER || id_object != OBJID_WINDOW || id_child != CHILDID_SELF {
+        return;
+    }
+    let mut taskbar = TASKBAR_HWND.load(Ordering::Relaxed) as HWND;
+    if taskbar.is_null() {
+        taskbar = FindWindowW(widez("Shell_TrayWnd").as_ptr(), core::ptr::null());
+        if taskbar.is_null() {
+            return; // explorer is down; nothing to watch yet
+        }
+        TASKBAR_HWND.store(taskbar as isize, Ordering::Relaxed);
+    }
+    if hwnd != taskbar {
+        return;
+    }
+    let strip = STRIP_HWND.load(Ordering::Relaxed) as HWND;
+    if strip.is_null() {
+        return;
+    }
+    // Demoted? Walk the windows stacked above the strip and look for the
+    // bar; anything else up there (menus, popups) is left alone.
+    let mut above = GetWindow(strip, GW_HWNDPREV);
+    for _ in 0..64 {
+        if above.is_null() {
+            return;
+        }
+        if above == taskbar {
+            SetWindowPos(
+                strip,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            return;
+        }
+        above = GetWindow(above, GW_HWNDPREV);
+    }
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
@@ -554,6 +624,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
             }
             WM_DESTROY => {
                 tray::remove(hwnd);
+                STRIP_HWND.store(0, std::sync::atomic::Ordering::Relaxed);
                 // Drop the App box now, before the window handle dies.
                 let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
                 if !p.is_null() {
@@ -565,6 +636,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM
             }
             _ => {
                 if TASKBAR_CREATED.get() == Some(&msg) {
+                    // The cached taskbar handle belongs to the old explorer.
+                    TASKBAR_HWND.store(0, std::sync::atomic::Ordering::Relaxed);
                     // Explorer restarted: the tray icon is gone, re-add it — unless
                     // the user hid it via settings.json.
                     if app_of(hwnd).is_some_and(|a| a.style.tray_icon == 1) {
@@ -770,6 +843,19 @@ fn main() {
                 core::ptr::null_mut(),
             );
         }
+
+        // Instant z-order recovery whenever the taskbar covers the strip:
+        // see `on_taskbar_reordered`.
+        STRIP_HWND.store(hwnd as isize, std::sync::atomic::Ordering::Relaxed);
+        SetWinEventHook(
+            EVENT_OBJECT_REORDER,
+            EVENT_OBJECT_REORDER,
+            core::ptr::null_mut(),
+            on_taskbar_reordered,
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
 
         // The tray icon is opt-out: `settings.json`'s `tray_icon: 0`
         // keeps it out of the notification area. Without the icon the

@@ -27,6 +27,18 @@ pub type HBITMAP = HANDLE;
 pub type HBRUSH = HANDLE;
 pub type HMENU = HANDLE;
 pub type HINSTANCE = HANDLE;
+pub type HWINEVENTHOOK = HANDLE;
+/// `SetWinEventHook` callback. With `WINEVENT_OUTOFCONTEXT` the hook calls
+/// this in the hooking thread, while it pumps messages.
+pub type WinEventProc = unsafe extern "system" fn(
+    hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    idObject: i32,
+    idChild: i32,
+    idThread: u32,
+    dwmsEventTime: u32,
+);
 pub type HGDIOBJ = HANDLE;
 pub type HKEY = *mut c_void;
 pub type LPARAM = isize;
@@ -247,6 +259,13 @@ pub const SWP_NOMOVE: u32 = 0x0002;
 pub const SWP_NOACTIVATE: u32 = 0x0010;
 pub const CW_USEDEFAULT: i32 = 0x8000_0000u32 as i32;
 
+// z-order watching (WinEvent hook)
+pub const GW_HWNDPREV: u32 = 3;
+pub const EVENT_OBJECT_REORDER: u32 = 0x8004;
+pub const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
+pub const OBJID_WINDOW: i32 = 0;
+pub const CHILDID_SELF: i32 = 0;
+
 // layered window
 pub const ULW_ALPHA: u32 = 0x0000_0002;
 pub const AC_SRC_ALPHA: u8 = 0x01;
@@ -409,6 +428,16 @@ unsafe extern "system" {
     pub fn SetWindowLongPtrW(hWnd: HWND, nIndex: i32, dwNewLong: isize) -> isize;
     pub fn GetWindowLongPtrW(hWnd: HWND, nIndex: i32) -> isize;
     pub fn FindWindowW(lpClassName: *const u16, lpWindowName: *const u16) -> HWND;
+    pub fn GetWindow(hWnd: HWND, nCmd: u32) -> HWND;
+    pub fn SetWinEventHook(
+        eventMin: u32,
+        eventMax: u32,
+        hmodWinEventProc: HINSTANCE,
+        pfnWinEventProc: WinEventProc,
+        idProcess: u32,
+        idThread: u32,
+        dwFlags: u32,
+    ) -> HWINEVENTHOOK;
     pub fn FindWindowExW(
         hWndParent: HWND,
         hWndChildAfter: HWND,
