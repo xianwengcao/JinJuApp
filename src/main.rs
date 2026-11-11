@@ -521,44 +521,46 @@ unsafe extern "system" fn on_taskbar_reordered(
     _time: u32,
 ) {
     use std::sync::atomic::Ordering;
-    if event != EVENT_OBJECT_REORDER || id_object != OBJID_WINDOW || id_child != CHILDID_SELF {
-        return;
-    }
-    let mut taskbar = TASKBAR_HWND.load(Ordering::Relaxed) as HWND;
-    if taskbar.is_null() {
-        taskbar = FindWindowW(widez("Shell_TrayWnd").as_ptr(), core::ptr::null());
+    unsafe {
+        if event != EVENT_OBJECT_REORDER || id_object != OBJID_WINDOW || id_child != CHILDID_SELF {
+            return;
+        }
+        let mut taskbar = TASKBAR_HWND.load(Ordering::Relaxed) as HWND;
         if taskbar.is_null() {
-            return; // explorer is down; nothing to watch yet
+            taskbar = FindWindowW(widez("Shell_TrayWnd").as_ptr(), core::ptr::null());
+            if taskbar.is_null() {
+                return; // explorer is down; nothing to watch yet
+            }
+            TASKBAR_HWND.store(taskbar as isize, Ordering::Relaxed);
         }
-        TASKBAR_HWND.store(taskbar as isize, Ordering::Relaxed);
-    }
-    if hwnd != taskbar {
-        return;
-    }
-    let strip = STRIP_HWND.load(Ordering::Relaxed) as HWND;
-    if strip.is_null() {
-        return;
-    }
-    // Demoted? Walk the windows stacked above the strip and look for the
-    // bar; anything else up there (menus, popups) is left alone.
-    let mut above = GetWindow(strip, GW_HWNDPREV);
-    for _ in 0..64 {
-        if above.is_null() {
+        if hwnd != taskbar {
             return;
         }
-        if above == taskbar {
-            SetWindowPos(
-                strip,
-                HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
+        let strip = STRIP_HWND.load(Ordering::Relaxed) as HWND;
+        if strip.is_null() {
             return;
         }
-        above = GetWindow(above, GW_HWNDPREV);
+        // Demoted? Walk the windows stacked above the strip and look for the
+        // bar; anything else up there (menus, popups) is left alone.
+        let mut above = GetWindow(strip, GW_HWNDPREV);
+        for _ in 0..64 {
+            if above.is_null() {
+                return;
+            }
+            if above == taskbar {
+                SetWindowPos(
+                    strip,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+                return;
+            }
+            above = GetWindow(above, GW_HWNDPREV);
+        }
     }
 }
 
