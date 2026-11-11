@@ -503,26 +503,34 @@ unsafe fn app_of(hwnd: HWND) -> Option<&'static mut App> {
 ///
 /// Explorer re-asserts the bar's topmost status whenever it is activated —
 /// button clicks, flyouts — which covers the strip sharing its band until
-/// the Z_ORDER_TIMER next fires. This hook watches the bar's z-order moves
-/// and restores the strip within the same message cycle, so the overlap is
-/// under one frame and never reads as a blink. The timer stays as the
-/// safety net for covers this hook does not see.
+/// the Z_ORDER_TIMER next fires. This hook watches the shell's z-order
+/// moves and restores the strip within the same message cycle, so the
+/// overlap is under one frame and never reads as a blink. The timer stays
+/// as the safety net for covers this hook does not see.
 ///
-/// Runs on the UI thread: the hook is OUTOFCONTEXT, delivered while the
-/// thread pumps messages. Legitimate overlays (menus, popups) are not
-/// fought here — only the taskbar's own z-order moves are.
+/// Identity comes from the z-order chain, not from the event: Windows
+/// reports top-level reorder events against the shell's desktop container
+/// (`#32769`), never against the window that actually moved. The probe
+/// proved the event's hwnd is useless for matching, so on every reorder
+/// event the chain above the strip is walked and the bar looked for
+/// directly. Runs on the UI thread: the hook is OUTOFCONTEXT, delivered
+/// while the thread pumps messages.
 unsafe extern "system" fn on_taskbar_reordered(
     _hook: HWINEVENTHOOK,
     event: u32,
-    hwnd: HWND,
-    id_object: i32,
-    id_child: i32,
+    _hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
     _thread: u32,
     _time: u32,
 ) {
     use std::sync::atomic::Ordering;
     unsafe {
-        if event != EVENT_OBJECT_REORDER || id_object != OBJID_WINDOW || id_child != CHILDID_SELF {
+        if event != EVENT_OBJECT_REORDER {
+            return;
+        }
+        let strip = STRIP_HWND.load(Ordering::Relaxed) as HWND;
+        if strip.is_null() {
             return;
         }
         let mut taskbar = TASKBAR_HWND.load(Ordering::Relaxed) as HWND;
@@ -533,15 +541,9 @@ unsafe extern "system" fn on_taskbar_reordered(
             }
             TASKBAR_HWND.store(taskbar as isize, Ordering::Relaxed);
         }
-        if hwnd != taskbar {
-            return;
-        }
-        let strip = STRIP_HWND.load(Ordering::Relaxed) as HWND;
-        if strip.is_null() {
-            return;
-        }
-        // Demoted? Walk the windows stacked above the strip and look for the
-        // bar; anything else up there (menus, popups) is left alone.
+        // Demoted? Walk the windows stacked above the strip and look for
+        // the bar; anything else up there (menus, popups, the invisible
+        // ShellHandwritingCanvas) is left alone.
         let mut above = GetWindow(strip, GW_HWNDPREV);
         for _ in 0..64 {
             if above.is_null() {

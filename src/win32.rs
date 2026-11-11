@@ -263,8 +263,6 @@ pub const CW_USEDEFAULT: i32 = 0x8000_0000u32 as i32;
 pub const GW_HWNDPREV: u32 = 3;
 pub const EVENT_OBJECT_REORDER: u32 = 0x8004;
 pub const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
-pub const OBJID_WINDOW: i32 = 0;
-pub const CHILDID_SELF: i32 = 0;
 
 // layered window
 pub const ULW_ALPHA: u32 = 0x0000_0002;
